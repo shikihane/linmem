@@ -36,8 +36,7 @@ class BM25Index:
                 VALUES (new.rowid, new.content);
             END;
             CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content)
-                VALUES ('delete', old.rowid, old.content);
+                DELETE FROM chunks_fts WHERE rowid = old.rowid;
             END;
         """)
         self._conn.commit()
