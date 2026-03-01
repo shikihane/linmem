@@ -1,74 +1,101 @@
-# linmem 项目记忆
+# CLAUDE.md
 
-## 项目概览
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-linmem 是一个基于 BM25 + LinearRAG（Tri-Graph + PageRank）的本地记忆搜索 CLI 工具。主要面向中文文档的索引和检索。
+## Project Overview
 
-- 语言: Python 3.10+
-- 构建: hatchling
-- 入口: `linmem` CLI（`src/linmem/cli.py:main`）
-- 许可: GPL-3.0-or-later
+linmem is a local memory search CLI tool combining BM25 full-text search (SQLite FTS5) with LinearRAG graph-based ranking (Tri-Graph + PageRank). Primarily targets Chinese documents.
 
-## 架构
+- Language: Python 3.10+, build system: hatchling
+- Entry point: `linmem` CLI via `src/linmem/cli.py:main`
+- License: GPL-3.0-or-later
+
+## Commands
+
+```bash
+# Install (dev mode)
+pip install -e ".[dev]"
+
+# Tests
+pytest tests/ -m "not slow"    # Fast tests only (no ML model deps), 50 tests
+pytest tests/ -m slow           # Integration tests (require spaCy + embedding models), 4 tests
+pytest tests/                   # All tests
+pytest tests/test_bm25.py -k "test_insert"  # Single test
+
+# CLI
+linmem index <directory>        # Index documents
+linmem search "<query>"         # Search
+linmem ask "<question>"         # Search + LLM answer (requires LLM config)
+linmem status                   # Index statistics
+```
+
+**CLI caveat**: `--data-dir` is a global option and must come *before* the subcommand (e.g., `linmem --data-dir ./myindex index ./docs/`).
+
+## Architecture
 
 ```
 文档 → [Ingest] chunk_text → [Index] BM25 + NER + Embedding + TriGraph → [Retrieve] BM25预筛 → LinearRAG两阶段排序 → [可选] LLM生成
 ```
 
-11 个源文件在 `src/linmem/`：cli, config, ingest, bm25, ner, embedding, graph, retriever, llm, utils, __init__
+### Module Dependency Graph
 
-## 2026-03-01 测试与部署实施 — 完成报告
-
-### 执行的计划
-
-来源: `docs/plans/2026-03-01-testing-deployment.md`
-
-### 完成的任务（6/6）
-
-| 任务 | 提交 | 内容 |
-|------|------|------|
-| 1. 修复模型默认值 | `47c8968` | config.py: en_core_web_trf → en_core_web_sm（CPU友好） |
-| 2. 添加 pytest 配置 | `9931654` | pyproject.toml: 添加 dev 依赖和 pytest markers |
-| 3. 单元测试 | `f672488` | 50 个纯逻辑测试，覆盖 utils/config/bm25/ingest/graph |
-| 4. 测试语料 | `ac80e7a` | 5 篇中文文档（虚构公司"星辰科技"，实体交叉覆盖） |
-| 5. 集成测试 | `3146af1` | 4 个 @pytest.mark.slow 测试（NER/全流程/增量/CLI） |
-| 6. CLI E2E 验证 | — | linmem index/search/status 均正常工作 |
-
-### 发现并修复的 Bug
-
-1. **BM25 FTS5 删除触发器**（`bm25.py`）: 使用了外部内容表的删除语法导致 `OperationalError`，改为 `DELETE FROM chunks_fts WHERE rowid = old.rowid`
-2. **BM25 FTS5 分词器**（`bm25.py`）: `unicode61` 无法分词中文，改为 `trigram` 分词器
-3. **Windows 路径兼容**: test_config.py 中 index_dir 断言改为 Path 对象比较
-4. **CLI 参数顺序**: `--data-dir` 是全局参数，必须放在子命令之前
-
-### 测试结果
-
-- 快速测试: `pytest tests/ -m "not slow"` → **50 passed**
-- 慢速测试: `pytest tests/ -m slow` → **4 passed**
-- 全部测试: `pytest tests/` → **54 passed**
-
-### 模型依赖
-
-| 模型 | 用途 | 大小 |
-|------|------|------|
-| `zh_core_web_sm` | spaCy 中文 NER | 75 MB |
-| `BAAI/bge-small-zh-v1.5` | 句向量嵌入 | 184 MB（含缓存） |
-
-注意: 在代理环境下 HuggingFace 模型下载需设置 `HF_ENDPOINT=https://hf-mirror.com`
-
-### 常用命令
-
-```bash
-# 测试
-pytest tests/ -m "not slow"    # 快速测试（无模型依赖）
-pytest tests/ -m slow           # 慢速测试（需要模型）
-pytest tests/                   # 全部测试
-
-# CLI
-linmem index <目录>             # 索引文档
-linmem search "<查询>"          # 搜索
-linmem status                   # 查看索引状态
-
-# 安装
-pip install -e ".[dev]"         # 开发模式安装
 ```
+cli.py
+├→ config.py          # Dataclass config, persisted as config.json
+├→ ingest.py          # File discovery + paragraph-based chunking
+│  └→ utils.py
+└→ retriever.py       # Orchestrates the full search pipeline
+   ├→ bm25.py         # SQLite FTS5 with trigram tokenizer
+   ├→ ner.py          # spaCy NER with JSON cache
+   ├→ embedding.py    # sentence-transformers, persisted as .npz
+   ├→ graph.py        # 3-layer graph (entity/sentence/paragraph) + PageRank
+   │  └→ utils.py
+   └→ llm.py          # Optional OpenAI-compatible LLM call
+```
+
+### Indexing Pipeline
+
+`ingest.discover_files()` → `read_file()` → `chunk_text()` produces `(hash_id, text)` tuples where hash_id = SHA-256. Then `retriever.index_chunks()` fans out to four stores in parallel: BM25 insert, NER extraction (batch), embedding computation (batch), and TriGraph node/edge construction.
+
+### Search Pipeline (Two-Stage)
+
+1. **BM25 pre-filter**: Top 100 candidates via SQLite FTS5
+2. **LinearRAG re-ranking**: Entity activation (3 iterations with semantic bridging via query-sentence cosine similarity) → Personalized PageRank over tri-graph → Paragraph scores
+3. **Score merging**: `final = graph_score * 0.95 + bm25_score * 0.05` (controlled by `passage_ratio`)
+
+### Storage Layout (default `.linmem/`)
+
+| File | Format | Contents |
+|------|--------|----------|
+| `bm25.db` | SQLite (WAL, FTS5 trigram) | Chunk text + full-text index |
+| `ner_cache.json` | JSON | `{hash_id: [entities]}` |
+| `embeddings/embeddings.npz` | NumPy compressed | Dense vectors (N × 384 for BGE) |
+| `embeddings/embedding_ids.json` | JSON | Positional hash_id mapping |
+| `trigraph.json` | JSON | Graph nodes, edges, sentence texts |
+| `chunks.json` | JSON | `{hash_id: text}` for result display |
+| `config.json` | JSON | Full config dump |
+
+## Key Design Decisions
+
+- **Trigram tokenizer** for FTS5: `unicode61` cannot segment Chinese; `trigram` works at character level for CJK.
+- **Lazy model loading**: spaCy and sentence-transformers models load only on first use.
+- **Hash-based dedup**: All stores use SHA-256 of chunk text as ID; re-indexing skips existing chunks.
+- **Language-dependent models**: Config `language` field ("zh"/"en") determines NER model (`zh_core_web_sm` vs `en_core_web_sm`) and embedding model (`BAAI/bge-small-zh-v1.5` vs `all-mpnet-base-v2`).
+
+## ML Model Dependencies
+
+| Model | Purpose | Size |
+|-------|---------|------|
+| `zh_core_web_sm` | spaCy Chinese NER | ~75 MB |
+| `BAAI/bge-small-zh-v1.5` | Sentence embeddings (Chinese) | ~184 MB |
+
+In proxy environments, set `HF_ENDPOINT=https://hf-mirror.com` for HuggingFace model downloads.
+
+## Test Fixtures
+
+Test corpus: 5 Chinese documents about fictional company "星辰科技" in `tests/fixtures/`. Entities cross-reference across documents (张明, 李薇, 星语, 星图, etc.) to exercise graph retrieval.
+
+## Known Pitfalls
+
+- BM25 FTS5 delete trigger must use `DELETE FROM chunks_fts WHERE rowid = old.rowid` (not external content table syntax).
+- Windows path assertions in tests must compare `Path` objects, not strings.

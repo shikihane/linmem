@@ -52,20 +52,56 @@ def cmd_index(args) -> None:
     print(f"Done. {new_count} new chunks indexed.")
 
 
-def cmd_search(args) -> None:
-    """Search indexed documents."""
+def cmd_index_jsonl(args) -> None:
+    """Index JSONL file (e.g., Claude Code logs)."""
+    from .ingest import ingest_jsonl
     from .retriever import Retriever
 
     cfg = _get_config(args)
+    jsonl_path = Path(args.jsonl_file)
+    if not jsonl_path.is_file():
+        print(f"Error: {jsonl_path} is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Indexing JSONL file: {jsonl_path} ...")
+    chunks = ingest_jsonl(jsonl_path, cfg)
+    if not chunks:
+        print("No records found in JSONL file.")
+        return
+
+    print(f"Found {len(chunks)} records, building index ...")
     retriever = Retriever(cfg)
-    results = retriever.search(args.query, top_k=cfg.retrieval_top_k)
+    new_count = retriever.index_chunks(chunks)
+    cfg.save()
+    print(f"Done. {new_count} new records indexed.")
+
+
+
+def cmd_search(args) -> None:
+    """Search indexed documents."""
+    from .retriever import Retriever
+    from .ingest import parse_timestamp
+
+    cfg = _get_config(args)
+    retriever = Retriever(cfg)
+
+    # Parse time range if provided
+    start_time = parse_timestamp(args.after) if hasattr(args, 'after') and args.after else None
+    end_time = parse_timestamp(args.before) if hasattr(args, 'before') and args.before else None
+
+    results = retriever.search(args.query, top_k=cfg.retrieval_top_k, start_time=start_time, end_time=end_time)
 
     if not results:
         print("No results found.")
         return
 
     for i, r in enumerate(results, 1):
-        print(f"\n--- Result {i} (score: {r['score']}) ---")
+        timestamp_str = ""
+        if 'timestamp' in r:
+            from datetime import datetime
+            dt = datetime.fromtimestamp(r['timestamp'])
+            timestamp_str = f" [{dt.isoformat()}]"
+        print(f"\n--- Result {i} (score: {r['score']}){timestamp_str} ---")
         print(r["text"][:500])
 
 
@@ -126,10 +162,17 @@ def main() -> None:
     p_index.add_argument("directory", help="Path to document directory")
     p_index.set_defaults(func=cmd_index)
 
+    # index-jsonl
+    p_index_jsonl = sub.add_parser("index-jsonl", help="Index JSONL file (e.g., Claude Code logs)")
+    p_index_jsonl.add_argument("jsonl_file", help="Path to JSONL file")
+    p_index_jsonl.set_defaults(func=cmd_index_jsonl)
+
     # search
     p_search = sub.add_parser("search", help="Search indexed documents")
     p_search.add_argument("query", help="Search query")
     p_search.add_argument("-k", "--top-k", type=int, help="Number of results")
+    p_search.add_argument("--after", help="Filter results after this time (ISO 8601)")
+    p_search.add_argument("--before", help="Filter results before this time (ISO 8601)")
     p_search.set_defaults(func=cmd_search)
 
     # ask

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 class BM25Index:
@@ -21,7 +21,9 @@ class BM25Index:
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS chunks (
                 hash_id TEXT PRIMARY KEY,
-                content TEXT NOT NULL
+                content TEXT NOT NULL,
+                timestamp REAL,
+                metadata TEXT
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 content,
@@ -43,30 +45,62 @@ class BM25Index:
 
     # --- public API ---
 
-    def insert(self, hash_id: str, text: str) -> bool:
-        """Insert a chunk. Returns False if hash_id already exists."""
+    def insert(self, hash_id: str, text: str, timestamp: Optional[float] = None, metadata: Optional[str] = None) -> bool:
+        """Insert a chunk. Returns False if hash_id already exists.
+
+        Args:
+            hash_id: Unique identifier for the chunk
+            text: Text content
+            timestamp: Unix timestamp (seconds since epoch)
+            metadata: JSON string with additional metadata
+        """
         try:
             self._conn.execute(
-                "INSERT INTO chunks (hash_id, content) VALUES (?, ?)",
-                (hash_id, text),
+                "INSERT INTO chunks (hash_id, content, timestamp, metadata) VALUES (?, ?, ?, ?)",
+                (hash_id, text, timestamp, metadata),
             )
             self._conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
-    def search(self, query: str, top_k: int = 100) -> List[Tuple[str, float]]:
-        """BM25 search. Returns list of (hash_id, bm25_score)."""
+    def search(self, query: str, top_k: int = 100, start_time: Optional[float] = None, end_time: Optional[float] = None) -> List[Tuple[str, float]]:
+        """BM25 search with optional temporal filtering.
+
+        Args:
+            query: Search query
+            top_k: Maximum number of results
+            start_time: Filter results after this timestamp (inclusive)
+            end_time: Filter results before this timestamp (inclusive)
+
+        Returns:
+            List of (hash_id, bm25_score) tuples
+        """
+        # Build WHERE clause for temporal filtering
+        where_clauses = ["chunks_fts MATCH ?"]
+        params = [query]
+
+        if start_time is not None:
+            where_clauses.append("c.timestamp >= ?")
+            params.append(start_time)
+
+        if end_time is not None:
+            where_clauses.append("c.timestamp <= ?")
+            params.append(end_time)
+
+        where_clause = " AND ".join(where_clauses)
+        params.append(top_k)
+
         rows = self._conn.execute(
-            """
+            f"""
             SELECT c.hash_id, f.rank
             FROM chunks_fts f
             JOIN chunks c ON c.rowid = f.rowid
-            WHERE chunks_fts MATCH ?
+            WHERE {where_clause}
             ORDER BY f.rank
             LIMIT ?
             """,
-            (query, top_k),
+            params,
         ).fetchall()
         # FTS5 rank is negative (lower = better), negate for positive scores
         return [(hid, -score) for hid, score in rows]

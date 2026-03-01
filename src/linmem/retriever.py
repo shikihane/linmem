@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -50,35 +50,58 @@ class Retriever:
 
     # --- indexing ---
 
-    def index_chunks(self, chunks: List[Tuple[str, str]]) -> int:
-        """Index a list of (hash_id, text) chunks. Returns count of new chunks."""
+    def index_chunks(self, chunks: List[Tuple[str, str, Optional[float], Optional[Dict]]] | List[Tuple[str, str]]) -> int:
+        """Index a list of chunks. Returns count of new chunks.
+
+        Args:
+            chunks: List of tuples, either:
+                - (hash_id, text) for backward compatibility
+                - (hash_id, text, timestamp, metadata) for temporal indexing
+        """
         new_count = 0
         prev_hash = None
 
+        # normalize input format
+        normalized_chunks = []
+        for chunk in chunks:
+            if len(chunk) == 2:
+                hid, txt = chunk
+                timestamp, metadata = None, None
+            elif len(chunk) == 4:
+                hid, txt, timestamp, metadata = chunk
+            else:
+                raise ValueError(f"Invalid chunk format: {chunk}")
+            normalized_chunks.append((hid, txt, timestamp, metadata))
+
         # filter already-indexed
-        new_chunks = [(hid, txt) for hid, txt in chunks if hid not in self._texts]
+        new_chunks = [(hid, txt, ts, meta) for hid, txt, ts, meta in normalized_chunks if hid not in self._texts]
         if not new_chunks:
             return 0
 
         # BM25
-        for hid, txt in new_chunks:
-            self.bm25.insert(hid, txt)
+        for hid, txt, timestamp, metadata in new_chunks:
+            import json
+            metadata_json = json.dumps(metadata) if metadata else None
+            self.bm25.insert(hid, txt, timestamp=timestamp, metadata=metadata_json)
 
-        # NER (batch)
+        # NER (batch) - only need (hid, txt) for NER
+        ner_input = [(hid, txt) for hid, txt, _, _ in new_chunks]
         ner_results = self.ner.extract_batch(
-            new_chunks, batch_size=self.cfg.ner_batch_size
+            ner_input, batch_size=self.cfg.ner_batch_size
         )
 
         # Embeddings (batch)
-        self.embeddings.add(new_chunks, batch_size=self.cfg.embedding_batch_size)
+        self.embeddings.add(ner_input, batch_size=self.cfg.embedding_batch_size)
 
         # Graph
-        for hid, txt in new_chunks:
+        for hid, txt, timestamp, metadata in new_chunks:
             entities = ner_results.get(hid, [])
             self.graph.add_paragraph(
                 hid, txt, entities,
                 language=self.cfg.language,
                 prev_hash_id=prev_hash,
+                timestamp=timestamp,
+                metadata=metadata,
             )
             self._texts[hid] = txt
             prev_hash = hid
@@ -117,15 +140,21 @@ class Retriever:
         sigma = np.clip(sigma, 0.0, 1.0)
         return sigma
 
-    def search(self, query: str, top_k: int | None = None) -> List[Dict]:
-        """BM25 pre-filter -> LinearRAG graph-enhanced ranking.
+    def search(self, query: str, top_k: int | None = None, start_time: Optional[float] = None, end_time: Optional[float] = None) -> List[Dict]:
+        """BM25 pre-filter -> LinearRAG graph-enhanced ranking with optional temporal filtering.
 
-        Returns list of dicts: {hash_id, text, score}
+        Args:
+            query: Search query
+            top_k: Number of results to return
+            start_time: Filter results after this timestamp (inclusive)
+            end_time: Filter results before this timestamp (inclusive)
+
+        Returns list of dicts: {hash_id, text, score, timestamp, metadata}
         """
         top_k = top_k or self.cfg.retrieval_top_k
 
-        # Step 1: BM25 pre-filter
-        bm25_results = self.bm25.search(query, top_k=self.cfg.bm25_top_k)
+        # Step 1: BM25 pre-filter with temporal filtering
+        bm25_results = self.bm25.search(query, top_k=self.cfg.bm25_top_k, start_time=start_time, end_time=end_time)
         if not bm25_results:
             return []
 
@@ -149,7 +178,21 @@ class Retriever:
             sigma_q=sigma_q,
         )
 
-        # Step 4: Merge scores
+        # Step 5: Filter graph results by time if needed
+        if start_time is not None or end_time is not None:
+            filtered_graph_results = []
+            for hid, score in graph_results:
+                meta = self.graph.get_paragraph_metadata(hid)
+                if meta and meta.get('timestamp') is not None:
+                    ts = meta['timestamp']
+                    if (start_time is None or ts >= start_time) and (end_time is None or ts <= end_time):
+                        filtered_graph_results.append((hid, score))
+                elif start_time is None and end_time is None:
+                    # No timestamp, include if no time filter
+                    filtered_graph_results.append((hid, score))
+            graph_results = filtered_graph_results
+
+        # Step 6: Merge scores
         # Combine BM25 and graph scores with passage_ratio weighting
         bm25_scores = {hid: score for hid, score in bm25_results}
         graph_scores = {hid: score for hid, score in graph_results}
@@ -178,11 +221,19 @@ class Retriever:
 
         results = []
         for hid, score in merged[:top_k]:
-            results.append({
+            result = {
                 "hash_id": hid,
                 "text": self._texts.get(hid, ""),
                 "score": round(score, 6),
-            })
+            }
+            # Add timestamp and metadata if available
+            meta = self.graph.get_paragraph_metadata(hid)
+            if meta:
+                if meta.get('timestamp') is not None:
+                    result['timestamp'] = meta['timestamp']
+                if meta.get('metadata'):
+                    result['metadata'] = meta['metadata']
+            results.append(result)
         return results
 
     # --- status ---

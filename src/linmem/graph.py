@@ -38,6 +38,9 @@ class TriGraph:
         self._paragraphs: List[str] = []     # paragraph hash_id -> index
         self._para_idx: Dict[str, int] = {}
 
+        # paragraph metadata (timestamp, event_type, etc.)
+        self._para_metadata: Dict[str, Dict] = {}
+
         # edges (use sets to avoid duplicates)
         self._mention_edges: Set[Tuple[int, int]] = set()  # (sent_idx, ent_idx)
         self._contain_edges: Set[Tuple[int, int]] = set()  # (para_idx, ent_idx)
@@ -81,6 +84,8 @@ class TriGraph:
         entities: List[str],
         language: str = "zh",
         prev_hash_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+        metadata: Optional[Dict] = None,
     ) -> None:
         """Add a paragraph (chunk) to the Tri-Graph.
 
@@ -90,11 +95,20 @@ class TriGraph:
             entities: NER entities found in this paragraph
             language: for sentence splitting
             prev_hash_id: previous paragraph hash_id (for adjacency edges)
+            timestamp: Unix timestamp (seconds since epoch)
+            metadata: Additional metadata (event_type, tool, file, etc.)
         """
         if hash_id in self._para_idx:
             return  # already indexed
 
         para_idx = self._get_or_add_paragraph(hash_id)
+
+        # store paragraph metadata
+        if timestamp is not None or metadata is not None:
+            self._para_metadata[hash_id] = {
+                'timestamp': timestamp,
+                'metadata': metadata or {}
+            }
 
         # adjacency edge to previous paragraph
         if prev_hash_id and prev_hash_id in self._para_idx:
@@ -302,6 +316,7 @@ class TriGraph:
         self._sent_idx = {s: i for i, s in enumerate(self._sentences)}
         self._paragraphs = data.get("paragraphs", [])
         self._para_idx = {p: i for i, p in enumerate(self._paragraphs)}
+        self._para_metadata = data.get("para_metadata", {})
         self._mention_edges = {tuple(e) for e in data.get("mention_edges", [])}
         self._contain_edges = {tuple(e) for e in data.get("contain_edges", [])}
         self._para_adj = {tuple(e) for e in data.get("para_adj", [])}
@@ -312,6 +327,7 @@ class TriGraph:
             "entities": self._entities,
             "sentences": self._sentences,
             "paragraphs": self._paragraphs,
+            "para_metadata": self._para_metadata,
             "mention_edges": list(self._mention_edges),
             "contain_edges": list(self._contain_edges),
             "para_adj": list(self._para_adj),
@@ -334,6 +350,10 @@ class TriGraph:
 
     def has_paragraph(self, hash_id: str) -> bool:
         return hash_id in self._para_idx
+
+    def get_paragraph_metadata(self, hash_id: str) -> Optional[Dict]:
+        """Get metadata for a paragraph (timestamp, event_type, etc.)."""
+        return self._para_metadata.get(hash_id)
 
     def get_sentence_texts(self) -> List[str]:
         """Return sentence texts in index order, for computing sigma_q."""

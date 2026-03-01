@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .config import LinmemConfig
 from .utils import text_hash
@@ -14,6 +16,7 @@ logger = logging.getLogger(__name__)
 # supported extensions
 _TEXT_EXTS = {".txt", ".md", ".markdown"}
 _PDF_EXTS = {".pdf"}
+_JSONL_EXTS = {".jsonl"}
 
 
 def discover_files(directory: Path) -> List[Path]:
@@ -118,3 +121,74 @@ def ingest_directory(
 
     logger.info("Produced %d unique chunks", len(all_chunks))
     return all_chunks
+
+
+def parse_timestamp(ts_str: Optional[str]) -> Optional[float]:
+    """Parse ISO 8601 timestamp string to Unix timestamp.
+
+    Args:
+        ts_str: ISO 8601 timestamp string (e.g., "2024-03-01T10:30:00Z")
+
+    Returns:
+        Unix timestamp (seconds since epoch) or None if parsing fails
+    """
+    if not ts_str:
+        return None
+    try:
+        # Try parsing with timezone
+        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+        return dt.timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def ingest_jsonl(
+    jsonl_path: Path,
+    config: LinmemConfig,
+) -> List[Tuple[str, str, Optional[float], Optional[Dict]]]:
+    """Ingest JSONL file (e.g., Claude Code execution logs).
+
+    Each line should be a JSON object with at least a 'content' field.
+    Optional fields: 'timestamp', 'type', 'tool', 'file', etc.
+
+    Returns list of (hash_id, text, timestamp, metadata) tuples.
+    """
+    logger.info("Reading JSONL file: %s", jsonl_path)
+
+    chunks: List[Tuple[str, str, Optional[float], Optional[Dict]]] = []
+    seen_hashes: set[str] = set()
+
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.warning("Line %d: Invalid JSON: %s", line_num, e)
+                continue
+
+            # Extract content
+            content = record.get('content', '')
+            if not content or not isinstance(content, str):
+                logger.debug("Line %d: No content field, skipping", line_num)
+                continue
+
+            # Parse timestamp
+            timestamp = parse_timestamp(record.get('timestamp'))
+
+            # Extract metadata (everything except content)
+            metadata = {k: v for k, v in record.items() if k != 'content'}
+
+            # Generate hash from content
+            h = text_hash(content)
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+
+            chunks.append((h, content, timestamp, metadata))
+
+    logger.info("Produced %d unique chunks from JSONL", len(chunks))
+    return chunks
