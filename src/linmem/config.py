@@ -48,7 +48,7 @@ class LinmemConfig:
 
     @property
     def ner_model(self) -> str:
-        return "zh_core_web_sm" if self.language == "zh" else "en_core_web_trf"
+        return "zh_core_web_sm" if self.language == "zh" else "en_core_web_sm"
 
     @property
     def embedding_model(self) -> str:
